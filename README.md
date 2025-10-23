@@ -20,7 +20,7 @@ Labs and project updates will be added here soon.
 
 - Maria Anthonyos
 - Mohamad Abdo
--Jonathan Bahry
+- Jonathan Bahry
 
 
 ---
