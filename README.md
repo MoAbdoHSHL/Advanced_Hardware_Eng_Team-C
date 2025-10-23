@@ -7,7 +7,7 @@ This is where our team will upload our **labs**, **project files**, and **develo
 
 - Maria Anthonyos
 - Mohamad Abdo
--Jonathan Bahry
+- Jonathan Bahry
 
 ---
 
@@ -16,12 +16,4 @@ Labs and project updates will be added here soon.
 
 ---
 
-## 👥 Team Members
-
-- Maria Anthonyos
-- Mohamad Abdo
-- Jonathan Bahry
-
-
----
 
