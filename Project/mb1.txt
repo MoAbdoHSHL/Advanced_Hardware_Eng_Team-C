@@ -1,0 +1,265 @@
+#include "xparameters.h"
+#include "xgpio.h"
+#include "xil_printf.h"
+#include "xstatus.h"
+#include <stdint.h>
+
+/********
+ *   CONFIG – MicroBlaze 1 domain
+ ********/
+
+#ifndef XPAR_XGPIO_0_DEVICE_ID
+#define XPAR_XGPIO_0_DEVICE_ID 0
+#endif
+
+#define GPIO_DEV_ID   XPAR_XGPIO_0_DEVICE_ID
+#define GPIO_CHANNEL  1
+
+#define SCL_MASK 0x1
+#define SDA_MASK 0x2
+
+#define TEMP_I2C_ADDR  0x48
+
+/********
+ *   SHARED BRAM (DMR mailbox)
+ ********/
+
+// from your xparameters.h (you showed it's 0xC0000000)
+#ifndef XPAR_AXI_BRAM_CTRL_0_BASEADDR
+#define XPAR_AXI_BRAM_CTRL_0_BASEADDR 0xC0000000U
+#endif
+
+#define SHARED_BASE      XPAR_AXI_BRAM_CTRL_0_BASEADDR
+#define TEMP_MB1_ADDR    (SHARED_BASE + 0x04U)
+#define MB1_VALID_ADDR   (SHARED_BASE + 0x0CU)
+
+volatile int32_t  *temp_mb1  = (int32_t *)TEMP_MB1_ADDR;
+volatile uint32_t *mb1_valid = (uint32_t *)MB1_VALID_ADDR;
+
+static XGpio Gpio;
+
+/* -------- small delays -------- */
+
+static void delay_cycles(volatile int cycles)
+{
+    while (cycles-- > 0) {
+        /* burn cycles */
+    }
+}
+
+static void i2c_delay(void)
+{
+    delay_cycles(300);
+}
+
+/* -------- GPIO / I2C helpers -------- */
+
+static void set_dir(u32 mask, int input)
+{
+    u32 dir = XGpio_GetDataDirection(&Gpio, GPIO_CHANNEL);
+    if (input)
+        dir |= mask;
+    else
+        dir &= ~mask;
+    XGpio_SetDataDirection(&Gpio, GPIO_CHANNEL, dir);
+}
+
+static void scl_write(int level)
+{
+    if (level)
+        set_dir(SCL_MASK, 1);
+    else
+        set_dir(SCL_MASK, 0);
+}
+
+static void sda_write(int level)
+{
+    if (level)
+        set_dir(SDA_MASK, 1);
+    else
+        set_dir(SDA_MASK, 0);
+}
+
+static int sda_read(void)
+{
+    set_dir(SDA_MASK, 1);
+    u32 val = XGpio_DiscreteRead(&Gpio, GPIO_CHANNEL);
+    return (val & SDA_MASK) ? 1 : 0;
+}
+
+static void i2c_init(void)
+{
+    XGpio_DiscreteWrite(&Gpio, GPIO_CHANNEL, 0x0000);
+    XGpio_SetDataDirection(&Gpio, GPIO_CHANNEL, SCL_MASK | SDA_MASK);
+}
+
+static void i2c_start(void)
+{
+    sda_write(1);
+    scl_write(1);
+    i2c_delay();
+    sda_write(0);
+    i2c_delay();
+    scl_write(0);
+}
+
+static void i2c_stop(void)
+{
+    sda_write(0);
+    i2c_delay();
+    scl_write(1);
+    i2c_delay();
+    sda_write(1);
+    i2c_delay();
+}
+
+static int i2c_write_byte(uint8_t data)
+{
+    for (int i = 7; i >= 0; --i) {
+        int bit = (data >> i) & 1;
+        if (bit)
+            sda_write(1);
+        else
+            sda_write(0);
+
+        i2c_delay();
+        scl_write(1);
+        i2c_delay();
+        scl_write(0);
+    }
+
+    sda_write(1);
+    i2c_delay();
+    scl_write(1);
+    i2c_delay();
+    int ack = !sda_read();
+    scl_write(0);
+
+    return ack;
+}
+
+static uint8_t i2c_read_byte(int send_ack)
+{
+    uint8_t data = 0;
+
+    sda_write(1);
+
+    for (int i = 7; i >= 0; --i) {
+        scl_write(1);
+        i2c_delay();
+        if (sda_read())
+            data |= (1 << i);
+        scl_write(0);
+        i2c_delay();
+    }
+
+    if (send_ack)
+        sda_write(0);
+    else
+        sda_write(1);
+
+    i2c_delay();
+    scl_write(1);
+    i2c_delay();
+    scl_write(0);
+    sda_write(1);
+
+    return data;
+}
+
+/* -------- TMP3 / TCN75A helpers -------- */
+
+static int tcn75_read_raw(int16_t *raw_out)
+{
+    uint8_t addr = TEMP_I2C_ADDR;
+    uint8_t msb, lsb;
+
+    i2c_init();
+
+    i2c_start();
+    if (!i2c_write_byte((addr << 1) | 0)) {
+        i2c_stop();
+        return -1;
+    }
+    if (!i2c_write_byte(0x00)) {
+        i2c_stop();
+        return -2;
+    }
+    i2c_stop();
+
+    i2c_start();
+    if (!i2c_write_byte((addr << 1) | 1)) {
+        i2c_stop();
+        return -3;
+    }
+
+    msb = i2c_read_byte(1);
+    lsb = i2c_read_byte(0);
+    i2c_stop();
+
+    *raw_out = (int16_t)((msb << 8) | lsb);
+    return 0;
+}
+
+// raw → centi-degrees (for BRAM / comparison)
+static int32_t tcn75_raw_to_centi(int16_t raw)
+{
+    int32_t code = (int32_t)raw;
+    code >>= 4;
+    int32_t temp_centi = (code * 25) / 4;  // 6.25°C * 100
+    return temp_centi;
+}
+
+static void tcn75_raw_to_temp_c(int16_t raw, int *degC, int *centi)
+{
+    int32_t temp_centi = tcn75_raw_to_centi(raw);
+    *degC  = temp_centi / 100;
+    *centi = temp_centi % 100;
+    if (*centi < 0) *centi = -*centi;
+}
+
+/* -------- MAIN -------- */
+
+int main(void)
+{
+    int status;
+
+    xil_printf("=== MB1: Pmod TMP3 + BRAM publisher ===\r\n");
+
+    status = XGpio_Initialize(&Gpio, GPIO_DEV_ID);
+    if (status != XST_SUCCESS) {
+        xil_printf("MB1: GPIO init failed: %d\r\n", status);
+        return XST_FAILURE;
+    }
+
+    xil_printf("MB1: GPIO init OK. Reading temperature and publishing...\r\n");
+
+    // Optional: clear valid flag at startup
+    *mb1_valid = 0;
+
+    while (1) {
+        int16_t raw;
+        int err = tcn75_read_raw(&raw);
+
+        if (err != 0) {
+            xil_printf("MB1: I2C error: %d\r\n", err);
+            delay_cycles(5000000);
+            continue;
+        }
+
+        // Convert to centi-deg and publish into shared BRAM
+        int32_t t1_centi = tcn75_raw_to_centi(raw);
+        *temp_mb1  = t1_centi;
+        *mb1_valid = 1;    // tell MB0 data is valid
+
+        int deg, centi;
+        tcn75_raw_to_temp_c(raw, &deg, &centi);
+
+        xil_printf("MB1: Raw=0x%04X  Temp=%d.%02d C\r\n",
+                   (uint16_t)raw, deg, centi);
+
+        delay_cycles(8000000);
+    }
+
+    return 0;
+}

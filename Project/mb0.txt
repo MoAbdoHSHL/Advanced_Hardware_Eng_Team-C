@@ -1,0 +1,251 @@
+#include "xparameters.h"
+#include "xil_printf.h"
+#include "xil_io.h"
+#include <stdint.h>
+#include <stdlib.h>
+
+#define SHARED_BASE      XPAR_AXI_BRAM_CTRL_0_BASEADDR
+#define TEMP_MB0_ADDR    (SHARED_BASE + 0x00)
+#define TEMP_MB1_ADDR    (SHARED_BASE + 0x04)
+#define STATUS_ADDR      (SHARED_BASE + 0x08)
+#define MB1_VALID_ADDR   (SHARED_BASE + 0x0C)
+
+volatile int32_t  *temp_mb0   = (int32_t *)TEMP_MB0_ADDR;
+volatile int32_t  *temp_mb1   = (int32_t *)TEMP_MB1_ADDR;
+volatile uint32_t *status     = (uint32_t *)STATUS_ADDR;
+volatile uint32_t *mb1_valid  = (uint32_t *)MB1_VALID_ADDR;
+
+#define DIFF_FAULT_CENTI     300
+#define COOLING_TEMP_CENTI   2500
+
+#ifdef XPAR_AXI_GPIO_MB0_TMPSENSOR3_BASEADDR
+  #define TMP3_GPIO_BASE   XPAR_AXI_GPIO_MB0_TMPSENSOR3_BASEADDR
+#elif defined(XPAR_XGPIO_1_BASEADDR)
+  #define TMP3_GPIO_BASE   XPAR_XGPIO_1_BASEADDR
+#else
+  #error "Cannot find TMP3 GPIO base address in xparameters.h"
+#endif
+
+#define TMP3_DATA    (TMP3_GPIO_BASE + 0x0)
+#define TMP3_TRI     (TMP3_GPIO_BASE + 0x4)
+
+#define SCL_MASK 0x1
+#define SDA_MASK 0x2
+#define TEMP_I2C_ADDR 0x48
+
+#ifdef XPAR_AXI_GPIO_0_BASEADDR
+  #define SEVSEG_BASE   XPAR_AXI_GPIO_0_BASEADDR
+#elif defined(XPAR_XGPIO_0_BASEADDR)
+  #define SEVSEG_BASE   XPAR_XGPIO_0_BASEADDR
+#else
+  #error "Cannot find 7-seg GPIO base address in xparameters.h"
+#endif
+
+#define SEVSEG_DATA   (SEVSEG_BASE + 0x0)
+#define SEVSEG_TRI    (SEVSEG_BASE + 0x4)
+
+static void delay_cycles(volatile int cycles) { while (cycles-- > 0) {} }
+static void i2c_delay(void) { delay_cycles(300); }
+
+#define SEG_BLANK 0xFF
+#define SEG_C     0xC6
+#define SEG_O     0xC0
+#define SEG_L     0xC7
+#define SEG_S     0x92
+#define SEG_T     0x87
+#define SEG_P     0x8C
+
+static inline void seg_write(uint8_t pattern)
+{
+    Xil_Out32(SEVSEG_DATA, (uint32_t)pattern);
+}
+
+static void seg_show_sequence(const uint8_t *seq, int len)
+{
+    for (int i = 0; i < len; i++) {
+        seg_write(seq[i]);
+        delay_cycles(8500000);
+    }
+    seg_write(SEG_BLANK);
+    delay_cycles(6500000);
+}
+
+static inline uint32_t tmp3_tri_read(void)  { return Xil_In32(TMP3_TRI); }
+static inline void tmp3_tri_write(uint32_t v){ Xil_Out32(TMP3_TRI, v); }
+static inline uint32_t tmp3_data_read(void) { return Xil_In32(TMP3_DATA); }
+static inline void tmp3_data_write(uint32_t v){ Xil_Out32(TMP3_DATA, v); }
+
+static void set_dir(uint32_t mask, int input)
+{
+    uint32_t tri = tmp3_tri_read();
+    if (input) tri |= mask; else tri &= ~mask;
+    tmp3_tri_write(tri);
+}
+
+static void scl_write(int level) { set_dir(SCL_MASK, level ? 1 : 0); }
+static void sda_write(int level) { set_dir(SDA_MASK, level ? 1 : 0); }
+
+static int sda_read(void)
+{
+    set_dir(SDA_MASK, 1);
+    return (tmp3_data_read() & SDA_MASK) ? 1 : 0;
+}
+
+static void i2c_init(void)
+{
+    tmp3_data_write(0x0);
+    set_dir(SCL_MASK | SDA_MASK, 1);
+}
+
+static void i2c_start(void)
+{
+    sda_write(1); scl_write(1); i2c_delay();
+    sda_write(0); i2c_delay();
+    scl_write(0);
+}
+
+static void i2c_stop(void)
+{
+    sda_write(0); i2c_delay();
+    scl_write(1); i2c_delay();
+    sda_write(1); i2c_delay();
+}
+
+static int i2c_write_byte(uint8_t data)
+{
+    for (int i = 7; i >= 0; --i) {
+        sda_write((data >> i) & 1);
+        i2c_delay();
+        scl_write(1); i2c_delay();
+        scl_write(0);
+    }
+
+    sda_write(1);
+    i2c_delay();
+    scl_write(1); i2c_delay();
+    int ack = !sda_read();
+    scl_write(0);
+    return ack;
+}
+
+static uint8_t i2c_read_byte(int send_ack)
+{
+    uint8_t data = 0;
+    sda_write(1);
+
+    for (int i = 7; i >= 0; --i) {
+        scl_write(1); i2c_delay();
+        if (sda_read()) data |= (1 << i);
+        scl_write(0); i2c_delay();
+    }
+
+    sda_write(send_ack ? 0 : 1);
+    i2c_delay();
+    scl_write(1); i2c_delay();
+    scl_write(0);
+    sda_write(1);
+    return data;
+}
+
+static int tcn75_read_raw(int16_t *raw_out)
+{
+    uint8_t addr = TEMP_I2C_ADDR;
+    uint8_t msb, lsb;
+
+    i2c_init();
+
+    i2c_start();
+    if (!i2c_write_byte((addr << 1) | 0)) { i2c_stop(); return -1; }
+    if (!i2c_write_byte(0x00))            { i2c_stop(); return -2; }
+    i2c_stop();
+
+    i2c_start();
+    if (!i2c_write_byte((addr << 1) | 1)) { i2c_stop(); return -3; }
+
+    msb = i2c_read_byte(1);
+    lsb = i2c_read_byte(0);
+    i2c_stop();
+
+    *raw_out = (int16_t)((msb << 8) | lsb);
+    return 0;
+}
+
+static int32_t tcn75_raw_to_centi(int16_t raw)
+{
+    int32_t code = (int32_t)raw;
+    code >>= 4;
+    return (code * 25) / 4;
+}
+
+static void tcn75_raw_to_temp_c(int16_t raw, int *degC, int *centi_abs)
+{
+    int32_t t = tcn75_raw_to_centi(raw);
+    *degC = (int)(t / 100);
+    int c = (int)(t % 100);
+    if (c < 0) c = -c;
+    *centi_abs = c;
+}
+
+int main(void)
+{
+    Xil_Out32(SEVSEG_TRI, 0x00000000);
+    seg_write(SEG_BLANK);
+
+    const uint8_t MSG_COOL[4] = { SEG_C, SEG_O, SEG_O, SEG_L };
+    const uint8_t MSG_STOP[4] = { SEG_S, SEG_T, SEG_O, SEG_P };
+
+    while (1) {
+        int16_t raw;
+        int err = tcn75_read_raw(&raw);
+        if (err != 0) {
+            xil_printf("MB0: I2C error: %d\r\n", err);
+            seg_write(SEG_BLANK);
+            delay_cycles(5000000);
+            continue;
+        }
+
+        int deg0, cent0;
+        tcn75_raw_to_temp_c(raw, &deg0, &cent0);
+
+        int32_t t0_centi = tcn75_raw_to_centi(raw);
+        *temp_mb0 = t0_centi;
+
+        if (*mb1_valid == 0) {
+            xil_printf("MB0: MB0=%d.%02d C (waiting for MB1)\r\n", deg0, cent0);
+            seg_write(SEG_BLANK);
+            delay_cycles(8000000);
+            continue;
+        }
+
+        int32_t t1_centi = *temp_mb1;
+
+        int32_t diff = t0_centi - t1_centi;
+        if (diff < 0) diff = -diff;
+
+        int32_t deg1  = t1_centi / 100;
+        int32_t cent1 = abs(t1_centi % 100);
+
+        if (diff >= DIFF_FAULT_CENTI) {
+            *status = 1;
+            xil_printf("SHUTDOWN\r\n");
+            *temp_mb0 = t0_centi;
+            while (1) {
+                seg_show_sequence(MSG_STOP, 4);
+            }
+        }
+
+        if ((t0_centi > COOLING_TEMP_CENTI) && (t1_centi > COOLING_TEMP_CENTI)) {
+            *status = 0;
+            xil_printf("comparator: COOL  MB0=%d.%02d C, MB1=%ld.%02ld C\r\n",
+                       deg0, cent0, (long)deg1, (long)cent1);
+            seg_show_sequence(MSG_COOL, 4);
+        } else {
+            *status = 0;
+            xil_printf("MB0: OK    MB0=%d.%02d C, MB1=%ld.%02ld C, |Δ|=%ld.%02ld C\r\n",
+                       deg0, cent0, (long)deg1, (long)cent1,
+                       (long)(diff/100), (long)abs(diff%100));
+            seg_write(SEG_BLANK);
+            delay_cycles(8000000);
+        }
+    }
+}
